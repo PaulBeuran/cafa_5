@@ -66,7 +66,7 @@ def get_cafa_5_data_dict(
         "prot_go_codes": (prot_go_code_df.groupby("id")["go_code"]
                                          .apply(list)[prot_seq_df["id"]]
                                          .tolist()),
-        "go_code_id": info_accr_weights_df["go_code"],
-        "go_code_info_accr_weight": info_accr_weights_df["info_accretion_weights"],
+        "go_code_id": info_accr_weights_df["go_code"].tolist(),
+        "go_code_info_accr_weight": info_accr_weights_df["info_accretion_weights"].tolist(),
     }
     

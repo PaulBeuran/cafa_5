@@ -10,6 +10,28 @@ from .dataset import CAFA5Dataset, tensor_nested_dict_to_device
 from .metrics import weighted_f_score
 
 
+class ClassWeightedBCELoss():
+
+    def __init__(
+        self,
+        class_weights: torch.Tensor,
+        **bce_loss_kwargs: dict[str, any]
+    ) -> None:
+        
+        self.class_weights = class_weights
+        self.reduction = "mean"
+        bce_loss_kwargs["reduction"] = "none"
+        self.bce_loss = torch.nn.BCELoss(**bce_loss_kwargs)
+
+    
+    def __call__(
+        self,
+        input: torch.Tensor,
+        target: torch.Tensor
+    ):
+        return (self.class_weights * self.bce_loss(input, target)).mean()
+    
+
 class TorchCAFA5Model(ABC, torch.nn.Module):
     """
     Abstract class of all deep models designed for the CAFA 5 competiton.
@@ -73,6 +95,8 @@ class TorchCAFA5Model(ABC, torch.nn.Module):
         loss_kwargs : None | dict[str, any] = None,
         optimizer_type : type = torch.optim.SGD,
         optimizer_kwargs : None | dict = None,
+        lr_scheduler_type : None | type = None,
+        lr_scheduler_kwargs : None | dict[str, any] = None,
         validation_size : float = 0.0,
         verbose : bool = False
     ) -> None:
@@ -104,6 +128,8 @@ class TorchCAFA5Model(ABC, torch.nn.Module):
         
         # Initialize other arguments
         loss_kwargs_ = loss_kwargs if loss_kwargs is not None else {}
+        if lr_scheduler_type is not None:
+            lr_scheduler = lr_scheduler_type(optimizer, **lr_scheduler_kwargs)
         
         # Split into train and validation set if specified
         if validation_size:
@@ -161,6 +187,9 @@ class TorchCAFA5Model(ABC, torch.nn.Module):
                 
                 # Optimize the parameters according to the gradient and the optimizer
                 optimizer.step()
+
+                if lr_scheduler_type is not None:
+                    lr_scheduler.step()
                 
                 # Update running metrics
                 train_running_loss += loss.item()
@@ -171,8 +200,10 @@ class TorchCAFA5Model(ABC, torch.nn.Module):
                 # Update the progress bar if needed
                 if verbose:
                     train_data_loader_.set_description(f"- Epoch: {epoch}, Mode: train, " + 
-                                                      f"Loss: {round(train_running_loss/(i+1), 6)}, " +  
-                                                      f"F-score : {round(train_running_f_score/(i+1), 6)}", 
+                                                      f"Loss: {round(train_running_loss/(i+1), 6)} ({round(loss.item(), 6)})," +  
+                                                      f"""F-score : {round(train_running_f_score/(i+1), 6)} ({round(weighted_f_score(go_codes_preds_batch, 
+                                                          data_batch["go_codes"], 
+                                                          go_codes_info_accr_weights), 6)})""", 
                                                       refresh=True)
                
             # If validation size has been specificed
@@ -222,11 +253,11 @@ class FCNN(torch.nn.Module):
     def __init__(
         self,
         input_size: int,
-        hidden_size: int,
         output_size: int,
-        hidden_activation,
-        output_activation,
+        output_activation: Callable[[torch.Tensor], torch.Tensor],
         num_layers: int = 0,
+        hidden_size: None | int = None,
+        hidden_activation: None | Callable[[torch.Tensor], torch.Tensor] = None,
         dropout: float = 0.,
     ):
         # Initialize torch.nn.Module
@@ -297,7 +328,7 @@ class CAFA5LSTM(TorchCAFA5Model):
     def forward(
         self,
         prot_seq
-    ):
+    ) -> torch.Tensor:
         """
         Compute the protein's GO codes probs. from their amino-acids sequence as such:
         - Get the amino-acids embeddings from the embedding layer using their respective tokens
@@ -329,3 +360,86 @@ class CAFA5LSTM(TorchCAFA5Model):
         go_codes_preds = self.fcnn(prot_seq_embedding)
         del prot_seq_embedding
         return go_codes_preds
+    
+
+def sinusoidal_position_encoding(
+    seq_len: int,
+    d_model : int      
+) -> torch.FloatTensor:
+    
+    pos_num_grid = torch.arange(seq_len).expand(d_model, -1).T
+    d_model_exp_denom_grid = 10000**(torch.arange(d_model/2).repeat_interleave(2).expand(seq_len, -1)*2/d_model)
+    pos_emb = pos_num_grid/d_model_exp_denom_grid
+    pos_emb[:, 0::2] = torch.sin(pos_emb[:, 0::2])
+    pos_emb[:, 1::2] = torch.cos(pos_emb[:, 1::2])
+    return pos_emb
+
+
+class CAFA5Transformer(TorchCAFA5Model):
+
+    def __init__(
+        self,
+        amino_acids_vocab: list[str],
+        go_codes_vocab: list[str],        
+        embedding_kwargs: None | dict[str, any] = None,
+        transformer_kwargs: None | dict[str, any] = None,
+        feed_forward_kwargs: None | dict[str, any] = None,
+    ):
+        
+        super().__init__()
+        
+        embedding_kwargs["num_embeddings"] = len(amino_acids_vocab) + 1
+        self.embedding = torch.nn.Embedding(**embedding_kwargs)
+
+        transformer_kwargs["d_model"] = embedding_kwargs["embedding_dim"]
+        transformer_kwargs["batch_first"] = True
+        self.transformer_encoder = torch.nn.Transformer(**transformer_kwargs).encoder
+
+        feed_forward_kwargs["input_size"] = transformer_kwargs["d_model"]
+        feed_forward_kwargs["output_size"] = len(go_codes_vocab)
+        feed_forward_kwargs["output_activation"] = torch.nn.Sigmoid()
+        self.feed_forward = FCNN(**feed_forward_kwargs)
+
+    
+    def forward(
+        self,
+        prot_seq
+    ):
+        
+        batch_size = prot_seq["input_ids"].shape[0]
+        seq_len = prot_seq["input_ids"].shape[1]
+        add_cls_token = torch.tensor(self.embedding.num_embeddings - 1).repeat(batch_size, 1).to(self.device)
+        input_ids = torch.cat([add_cls_token, prot_seq["input_ids"]], dim=1)
+        attention_mask = torch.cat([torch.ones(batch_size, 1).to(self.device), prot_seq["attention_mask"]], dim=1) == 0
+
+        amino_acids_embeddings = self.embedding(input_ids)
+        amino_acids_embeddings += sinusoidal_position_encoding(seq_len + 1, self.embedding.embedding_dim).to(self.device)
+        amino_acids_embeddings = self.transformer_encoder(amino_acids_embeddings, 
+                                                          src_key_padding_mask = attention_mask)
+        
+        prot_seq_embedding = amino_acids_embeddings[:, 0, :]
+        go_codes_preds = self.feed_forward(prot_seq_embedding)
+
+        return go_codes_preds
+    
+
+class StepLRScheduler():
+
+    def __init__(
+        self,
+        optimizer: torch.optim.Optimizer,
+        d_model: int = 512,
+        warmum_steps: int = 4000
+    ):
+        
+        self.optimizer = optimizer
+        self.d_model = d_model
+        self.warmup_steps = warmum_steps
+        self.step_num = 1
+
+    def step(
+        self,
+    ):
+        self.optimizer.lr = self.d_model**(-0.5) * min(self.step_num**(-0.5), 
+                                                       self.step_num * self.warmup_steps**(-1.5))
+        self.step_num += 1

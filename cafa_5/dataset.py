@@ -102,8 +102,8 @@ def collate_tok_mult_out_batch(
     return {
         "id": ids,
         "sequence": {
-            "input_ids": torch.cat(sequences_input_ids),
-            "attention_mask": torch.cat(sequences_attention_mask)
+            "input_ids": torch.nested.to_padded_tensor(torch.nested.nested_tensor(sequences_input_ids), 0).squeeze(),
+            "attention_mask": torch.nested.to_padded_tensor(torch.nested.nested_tensor(sequences_attention_mask), 0).squeeze()
         },
         "go_codes": torch.cat(go_codes)
     }

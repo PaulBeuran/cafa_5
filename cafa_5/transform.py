@@ -49,7 +49,8 @@ class CharTokenizer(TrainableTransform):
 
     def __init__(
         self,
-        max_size: None | int = None
+        max_size: None | int = None,
+        padding: None | str = None,
     ):
         super().__init__()
         self.tokenizer = Tokenizer(WordLevel())
@@ -57,6 +58,7 @@ class CharTokenizer(TrainableTransform):
         self.tokenizer.pre_tokenizer = Split("", "removed")
         self.vocab = None
         self.max_size = max_size
+        self.padding = False if padding is None else padding
 
 
     def fit(
@@ -88,7 +90,7 @@ class CharTokenizer(TrainableTransform):
         Transform the tokens into their ids. in the vocabulary, as well as the attention
         mask on the tokens
         """
-        return self.fast_tokenizer(char_seqs, padding = "max_length", truncation = True, 
+        return self.fast_tokenizer(char_seqs, padding = self.padding, truncation = True, 
                                    return_tensors = "pt", return_token_type_ids = False)
     
 
