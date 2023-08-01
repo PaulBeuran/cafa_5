@@ -1,13 +1,14 @@
 from abc import ABC
 from typing import Callable
 
-import sys
+from copy import deepcopy
+import os
 import torch
-from torch.utils.data import random_split, DataLoader
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from .dataset import CAFA5Dataset, tensor_nested_dict_to_device
-from .metrics import weighted_f_score
+from .metrics import weighted_f_score, weighted_f_score_by_group
 
 
 class ClassWeightedBCELoss():
@@ -87,7 +88,7 @@ class TorchCAFA5Model(ABC, torch.nn.Module):
         
     def fit(
         self,
-        train_cafa_5_dataset: CAFA5Dataset,
+        cafa_5_dataset: CAFA5Dataset,
         epochs : int = 1,
         batch_size : int = 1,
         collate_fn : None | Callable[[any], any] = None,
@@ -98,7 +99,8 @@ class TorchCAFA5Model(ABC, torch.nn.Module):
         lr_scheduler_type : None | type = None,
         lr_scheduler_kwargs : None | dict[str, any] = None,
         validation_size : float = 0.0,
-        verbose : bool = False
+        verbose : bool = False,
+        checkpoint_save_folder_path: None | str = None
     ) -> None:
         """
         Train the model given some proteins data, using the back-propagation algorithm.
@@ -119,8 +121,9 @@ class TorchCAFA5Model(ABC, torch.nn.Module):
         """
 
         # Get information accretion weights from dataset
-        go_codes_info_accr_weights = train_cafa_5_dataset.go_codes_info_accr_weights
+        go_codes_info_accr_weights = cafa_5_dataset.go_codes_info_accr_weights
         go_codes_info_accr_weights = torch.tensor(go_codes_info_accr_weights).to(self.device)
+        go_codes_subontology = cafa_5_dataset.go_codes_subontology
 
         # Initialize the optimizer
         optimizer_kwargs_ = optimizer_kwargs if optimizer_kwargs is not None else {} 
@@ -133,10 +136,10 @@ class TorchCAFA5Model(ABC, torch.nn.Module):
         
         # Split into train and validation set if specified
         if validation_size:
-            lengths = [(1 if validation_size < 1 else len(train_cafa_5_dataset)) - validation_size, validation_size]
+            lengths = [(1 if validation_size < 1 else len(cafa_5_dataset)) - validation_size, validation_size]
             train_cafa_5_dataset, val_cafa_5_dataset = (
                 split for split in 
-                torch.utils.data.random_split(train_cafa_5_dataset, lengths)
+                torch.utils.data.random_split(cafa_5_dataset, lengths)
             )
 
         # Initialize data loaders
@@ -178,8 +181,8 @@ class TorchCAFA5Model(ABC, torch.nn.Module):
                 optimizer.zero_grad()
 
                 # Make predictions
-                go_codes_probs_batch = self(data_batch["sequence"])
-                go_codes_preds_batch = (go_codes_probs_batch >= 0.5).float()#.to_sparse_csr()
+                go_codes_probs_batch = self(data_batch["data"])
+                go_codes_preds_batch = (go_codes_probs_batch >= 0.5).float()
                 
                 # Compute loss and backpropagate loss gradient for each parameters
                 loss = loss_fn(go_codes_probs_batch, data_batch["go_codes"].float(), **loss_kwargs_)
@@ -193,9 +196,10 @@ class TorchCAFA5Model(ABC, torch.nn.Module):
                 
                 # Update running metrics
                 train_running_loss += loss.item()
-                train_running_f_score += weighted_f_score(go_codes_preds_batch, 
-                                                          data_batch["go_codes"], 
-                                                          go_codes_info_accr_weights)
+                train_running_f_score += weighted_f_score_by_group(go_codes_preds_batch, 
+                                                                   data_batch["go_codes"], 
+                                                                   go_codes_info_accr_weights,
+                                                                   go_codes_subontology)
                 
                 # Update the progress bar if needed
                 if verbose:
@@ -228,24 +232,83 @@ class TorchCAFA5Model(ABC, torch.nn.Module):
                         )
                     
                         # Make predictions
-                        go_codes_probs_batch = self(data_batch["sequence"])
+                        go_codes_probs_batch = self(data_batch["data"])
                         go_codes_preds_batch = (go_codes_probs_batch >= 0.5).float()
                         
                         # Compute metrics
                         val_running_loss += loss_fn(go_codes_probs_batch, data_batch["go_codes"].float()).item()
-                        val_running_f_score += weighted_f_score(go_codes_preds_batch, 
-                                                                data_batch["go_codes"], 
-                                                                go_codes_info_accr_weights)
+                        val_running_f_score += weighted_f_score_by_group(go_codes_preds_batch, 
+                                                                         data_batch["go_codes"], 
+                                                                         go_codes_info_accr_weights,
+                                                                         go_codes_subontology)
 
                         # Update the progress bar if needed
                         if verbose:
                             val_data_loader_.set_description(f"- Epoch: {epoch}, Mode: validation, " + 
                                                             f"Loss: {round(val_running_loss/(i+1), 6)}, " +  
-                                                            f"F-score : {round(val_running_f_score/(i+1), 6)}", 
+                                                            f"""F-score : {round(val_running_f_score/(i+1), 6)}""", 
                                                             refresh=True)
-                        
+                            
+            checkpoint_save_file_path = os.path.join(checkpoint_save_folder_path, f"weights_{epoch}.pt")
+            torch.save({
+                "epoch": epoch, 
+                "state_dict": self.state_dict(), 
+                "train_loss": train_running_loss/len(train_data_loader_),
+                "train_f_score": train_running_f_score/len(train_data_loader_),
+                "val_loss": val_running_loss/len(val_data_loader_),
+                "val_f_score": val_running_f_score/len(val_data_loader_),
+            }, checkpoint_save_file_path)
+                            
 
-class FCNN(torch.nn.Module):
+    def predict_proba(
+        self,
+        cafa_5_dataset: CAFA5Dataset,
+        batch_size : int = 1,
+        collate_fn : None | Callable[[any], any] = None,
+        verbose: bool = False,        
+        submission_tsv_path: str = "submission.tsv"
+    ):
+        
+        # Initialize data loaders
+        data_loader = DataLoader(cafa_5_dataset, batch_size = batch_size, 
+                                 collate_fn = collate_fn)
+        # Set the model to evaluation mode
+        self.eval()
+
+        # Add a layer on the iterators for the progress bar
+        if verbose:
+            data_loader = tqdm(data_loader, position=0, leave=True)
+
+        # No need to compute the gradients when evaluating
+        with torch.no_grad():
+            
+            with open(submission_tsv_path, "w+") as f:
+                
+                f.write("Protein Id\tGO Term Id\tPrediction\n")
+
+                # Validation step by batch
+                for i, data_batch in enumerate(data_loader):
+
+                    # Transfer the data to device
+                    data_batch = tensor_nested_dict_to_device(
+                        data_batch, self.device
+                    )
+                
+                    # Make predictions
+                    go_codes_probs_batch = self(data_batch["data"])
+                    go_codes_pos_mask = (go_codes_probs_batch >= 0.5).cpu()
+                    prots_go_codes = cafa_5_dataset.prot_go_codes_transform.inverse_transform(go_codes_pos_mask)
+                    for i in range(go_codes_probs_batch.shape[0]):
+                        prot_id = data_batch["id"][i]
+                        prot_go_codes = prots_go_codes[i]
+                        prot_go_codes_probs = go_codes_probs_batch[i, go_codes_pos_mask[i]]
+                        for j in range(len(prot_go_codes)):
+                            prot_go_code = prot_go_codes[j]
+                            prot_go_code_prob = prot_go_codes_probs[j]
+                            f.write(prot_id + "\t" + prot_go_code + "\t" + str(prot_go_code_prob.item()) + "\n")
+
+
+class FFN(torch.nn.Module):
     """
     Fully connected neural network class
     """
@@ -259,6 +322,8 @@ class FCNN(torch.nn.Module):
         hidden_size: None | int = None,
         hidden_activation: None | Callable[[torch.Tensor], torch.Tensor] = None,
         dropout: float = 0.,
+        batch_normalization: bool = False,
+        residual_connections: bool = False
     ):
         # Initialize torch.nn.Module
         super().__init__()
@@ -271,156 +336,64 @@ class FCNN(torch.nn.Module):
         self.hidden_activation = hidden_activation
         self.output_activation = output_activation
         self.dropout = dropout
-        
-        # Create the MLP from a sequence of linear transformations followed by
-        # the element-wise non-linear operation, with additional dropout if specified
-        mlp = []
+        self.batch_normalization = batch_normalization
+        self.residual_connections = residual_connections
+
+        self.ffn = torch.nn.ModuleDict()
+        i = -1
+        if batch_normalization:
+            self.bn = torch.nn.BatchNorm1d(self.input_size)
         for i in range(num_layers):
-            mlp.append(torch.nn.Linear(input_size if not i else hidden_size, hidden_size))
-            mlp.append(self.hidden_activation)
+            self.ffn[f"linear_{i}"] = torch.nn.Linear(input_size if not i else hidden_size, hidden_size)
+            if batch_normalization:
+                self.ffn[f"batch_norm_{i}"] = deepcopy(torch.nn.BatchNorm1d(self.hidden_size))
+            self.ffn[f"activation_{i}"] = deepcopy(self.hidden_activation)
             if dropout:
-                mlp.append(torch.nn.Dropout(dropout))
-        mlp.append(torch.nn.Linear(input_size if num_layers == 0 else hidden_size, output_size))
-        mlp.append(output_activation)
-        self.mlp = torch.nn.Sequential(*mlp)
-        
+                self.ffn[f"dropout_{i}"] = torch.nn.Dropout(dropout)
+        self.ffn[f"linear_{i+1}"] = torch.nn.Linear(input_size if num_layers == 0 else hidden_size, output_size)
+        self.ffn[f"activation_{i+1}"] = output_activation
 
-    def forward(self, inputs):
 
-        # Pass the inputs to the MLP class
-        return self.mlp(inputs)
-            
+    def forward(self, input):
 
-class CAFA5LSTM(TorchCAFA5Model):
-    """
-    LSTM folled by an FCL, applied to CAFA 5 competion
-    """
+        output = input
+        if self.batch_normalization:
+            output = self.bn(output)
+        for i in range(self.num_layers + 1):
+            if i != 0 and i != self.num_layers and self.residual_connections:
+                res = output
+            output = self.ffn[f"linear_{i}"](output)
+            if i != self.num_layers and self.batch_normalization:
+                output = self.ffn[f"batch_norm_{i}"](output)
+            output = self.ffn[f"activation_{i}"](output)
+            if i != 0 and i != self.num_layers and self.residual_connections:
+                output = output + res
+            if i != self.num_layers and self.dropout:
+                output = self.ffn[f"dropout_{i}"](output) 
+        return output
+    
+
+class CAFA5EmbeddingsFFN(TorchCAFA5Model):
 
     def __init__(
         self,
-        amino_acids_vocab: list[str],
-        go_codes_vocab: list[str],
-        embedding_kwargs: dict[str, any],
-        lstm_kwargs: dict[str, any],
-        fcnn_kwargs: dict[str, any]
-    ):
-        # Initialize TorchCAFA5Model
-        super().__init__()
-        
-        # Initialize embedding layer
-        embedding_kwargs["num_embeddings"] = len(amino_acids_vocab)
-        self.embedding = torch.nn.Embedding(**embedding_kwargs)
-        
-        # Initialize LSTM layers
-        lstm_kwargs["input_size"] = embedding_kwargs["embedding_dim"]
-        lstm_kwargs["batch_first"] = True
-        self.lstm = torch.nn.LSTM(**lstm_kwargs)
-        
-        # Initialize FCN layers
-        fcnn_kwargs["input_size"] = ((self.lstm.bidirectional + 1) * 
-                                    (self.lstm.proj_size if self.lstm.proj_size > 0 
-                                                         else self.lstm.hidden_size))
-        fcnn_kwargs["output_size"] = len(go_codes_vocab)
-        fcnn_kwargs["output_activation"] = torch.nn.Sigmoid()
-        self.fcnn = FCNN(**fcnn_kwargs)
-        
-    
-    def forward(
-        self,
-        prot_seq
-    ) -> torch.Tensor:
-        """
-        Compute the protein's GO codes probs. from their amino-acids sequence as such:
-        - Get the amino-acids embeddings from the embedding layer using their respective tokens
-        - Get the protein sequence embedding from the LSTM's last hidden state using the amino-acids embeddings
-        - Get the GO codes probs. from the FCNN output using the the protein sequence embedding
-        """
-        
-        # Get the amino-acids embeddings
-        amino_acids_embeddings = self.embedding(prot_seq["input_ids"])
-
-        # Pack the padded sequence, to avoid useless computations of padding
-        amino_acids_embeddings_packed = torch.nn.utils.rnn.pack_padded_sequence(
-            amino_acids_embeddings,
-            prot_seq["attention_mask"].sum(dim=1).to("cpu"), 
-            batch_first=True,
-            enforce_sorted=False
-        )
-
-        # Get the protein sequence embedding from the LSTM's last hidden state
-        prot_seq_embedding = self.lstm(amino_acids_embeddings_packed)[1][0]
-        prot_seq_embedding = prot_seq_embedding.view(self.lstm.num_layers, 2, 
-                                                     amino_acids_embeddings.shape[0], 
-                                                     self.lstm.hidden_size)
-        prot_seq_embedding = prot_seq_embedding[-1]
-        prot_seq_embedding = torch.cat([prot_seq_embedding[0], prot_seq_embedding[1]], dim=1)
-        del amino_acids_embeddings
-
-        # Get the GO codes probs
-        go_codes_preds = self.fcnn(prot_seq_embedding)
-        del prot_seq_embedding
-        return go_codes_preds
-    
-
-def sinusoidal_position_encoding(
-    seq_len: int,
-    d_model : int      
-) -> torch.FloatTensor:
-    
-    pos_num_grid = torch.arange(seq_len).expand(d_model, -1).T
-    d_model_exp_denom_grid = 10000**(torch.arange(d_model/2).repeat_interleave(2).expand(seq_len, -1)*2/d_model)
-    pos_emb = pos_num_grid/d_model_exp_denom_grid
-    pos_emb[:, 0::2] = torch.sin(pos_emb[:, 0::2])
-    pos_emb[:, 1::2] = torch.cos(pos_emb[:, 1::2])
-    return pos_emb
-
-
-class CAFA5Transformer(TorchCAFA5Model):
-
-    def __init__(
-        self,
-        amino_acids_vocab: list[str],
-        go_codes_vocab: list[str],        
-        embedding_kwargs: None | dict[str, any] = None,
-        transformer_kwargs: None | dict[str, any] = None,
-        feed_forward_kwargs: None | dict[str, any] = None,
-    ):
+        n_go_codes: int,
+        t5_embeddings_size: int = 1024,
+        protbert_embeddings_size: int = 1024,
+        esm2_embeddings_size: int = 2560,
+        **kwargs
+    ) -> None:
         
         super().__init__()
+        kwargs["input_size"] = t5_embeddings_size + protbert_embeddings_size + esm2_embeddings_size
+        kwargs["output_activation"] = torch.nn.Sigmoid()
+        kwargs["output_size"] = n_go_codes
+        self.ffn = FFN(**kwargs)
+
+    def forward(self, prots_seq: any) -> any:
         
-        embedding_kwargs["num_embeddings"] = len(amino_acids_vocab) + 1
-        self.embedding = torch.nn.Embedding(**embedding_kwargs)
-
-        transformer_kwargs["d_model"] = embedding_kwargs["embedding_dim"]
-        transformer_kwargs["batch_first"] = True
-        self.transformer_encoder = torch.nn.Transformer(**transformer_kwargs).encoder
-
-        feed_forward_kwargs["input_size"] = transformer_kwargs["d_model"]
-        feed_forward_kwargs["output_size"] = len(go_codes_vocab)
-        feed_forward_kwargs["output_activation"] = torch.nn.Sigmoid()
-        self.feed_forward = FCNN(**feed_forward_kwargs)
-
-    
-    def forward(
-        self,
-        prot_seq
-    ):
-        
-        batch_size = prot_seq["input_ids"].shape[0]
-        seq_len = prot_seq["input_ids"].shape[1]
-        add_cls_token = torch.tensor(self.embedding.num_embeddings - 1).repeat(batch_size, 1).to(self.device)
-        input_ids = torch.cat([add_cls_token, prot_seq["input_ids"]], dim=1)
-        attention_mask = torch.cat([torch.ones(batch_size, 1).to(self.device), prot_seq["attention_mask"]], dim=1) == 0
-
-        amino_acids_embeddings = self.embedding(input_ids)
-        amino_acids_embeddings += sinusoidal_position_encoding(seq_len + 1, self.embedding.embedding_dim).to(self.device)
-        amino_acids_embeddings = self.transformer_encoder(amino_acids_embeddings, 
-                                                          src_key_padding_mask = attention_mask)
-        
-        prot_seq_embedding = amino_acids_embeddings[:, 0, :]
-        go_codes_preds = self.feed_forward(prot_seq_embedding)
-
-        return go_codes_preds
+        return self.ffn(torch.cat([embeddings for data_id, embeddings in prots_seq.items()
+                                   if data_id not in ["amino_acids_tokens"]], dim=-1))
     
 
 class StepLRScheduler():

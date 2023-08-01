@@ -1,6 +1,8 @@
 from abc import ABC
 from typing import Any
 
+import scipy
+
 from sklearn.preprocessing import MultiLabelBinarizer
 
 from tokenizers import Tokenizer
@@ -54,11 +56,9 @@ class CharTokenizer(TrainableTransform):
     ):
         super().__init__()
         self.tokenizer = Tokenizer(WordLevel())
-        self.trainer = WordLevelTrainer(special_tokens=["[PAD]", "[UNK]"])
+        self.trainer = WordLevelTrainer(special_tokens=["[PAD]", "[UNK]", "[CLS]"])
         self.tokenizer.pre_tokenizer = Split("", "removed")
         self.vocab = None
-        self.max_size = max_size
-        self.padding = False if padding is None else padding
 
 
     def fit(
@@ -77,7 +77,8 @@ class CharTokenizer(TrainableTransform):
             tokenizer_object = self.tokenizer, 
             model_max_length = self.max_size,
             pad_token = "[PAD]",
-            unk_token = "[UNK]"
+            unk_token = "[UNK]",
+            cls_token = "[CLS]"
         )
         self.is_fitted = True
         
@@ -92,7 +93,17 @@ class CharTokenizer(TrainableTransform):
         """
         return self.fast_tokenizer(char_seqs, padding = self.padding, truncation = True, 
                                    return_tensors = "pt", return_token_type_ids = False)
+
+
+def scipy_csr_to_torch_csr(
+    scipy_csr: scipy.sparse.csr_array
+):
     
+    crow_indices = scipy_csr.indptr
+    col_indices = scipy_csr.indices
+    values = scipy_csr.data
+    return torch.sparse_csr_tensor(crow_indices, col_indices, values)
+
 
 class MultiOutputBinarizer(TrainableTransform):
     """
@@ -101,10 +112,12 @@ class MultiOutputBinarizer(TrainableTransform):
 
     def __init__(
         self,
-        outputs: None | list[str] = None
+        outputs: None | list[str] = None,
+        sparse_output: bool = False
     ):
         super().__init__()
-        self.multi_output_binarizer = MultiLabelBinarizer(sparse_output=False)
+        self.sparse_output = sparse_output
+        self.multi_output_binarizer = MultiLabelBinarizer(sparse_output=sparse_output)
         if outputs:
             self.outputs = sorted(outputs)
             self.multi_output_binarizer.fit([self.outputs])
@@ -135,4 +148,7 @@ class MultiOutputBinarizer(TrainableTransform):
             outs_ = [outputs]
         else:
             outs_ = outputs
-        return torch.tensor(self.multi_output_binarizer.transform(outs_))#scipy_csr_to_torch_csr(self.multi_output_binarizer.transform(outs_)).int()    
+        if not self.sparse_output:
+            return torch.tensor(self.multi_output_binarizer.transform(outs_))
+        else:
+            return scipy_csr_to_torch_csr(self.multi_output_binarizer.transform(outs_)).int()    
